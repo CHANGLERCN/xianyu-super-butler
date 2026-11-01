@@ -91,10 +91,6 @@ export const changePassword = async (currentPassword: string, newPassword: strin
 
 // Accounts
 export const getAccountDetails = async (): Promise<AccountDetail[]> => {
-  // 只发一次请求。原实现拿到账号列表后，再逐个请求 /cookie/{id}/details 补
-  // username/password/show_browser —— 而列表接口内部本来就查了同一份详情，
-  // 等于对同一份数据做 N+1。页面上有 7 处组件各自调用本函数，账号一多首屏
-  // 就被这些重复请求拖慢；现在列表接口直接返回这几个字段。
   const data = await get<any[]>('/cookies/details');
   return data.map(item => ({
     id: item.id,
@@ -105,10 +101,7 @@ export const getAccountDetails = async (): Promise<AccountDetail[]> => {
     remark: item.remark,
     note: item.remark,
     pause_duration: item.pause_duration,
-    username: item.username,
-    login_password: item.login_password,
-    show_browser: item.show_browser,
-    nickname: item.nickname || item.remark || item.username || `账号 ${item.id.substring(0, 6)}`,
+    nickname: item.nickname || item.remark || `账号 ${item.id.substring(0, 6)}`,
     avatar_url: item.avatar_url,
     location: item.location,
     bio: item.bio,
@@ -122,14 +115,6 @@ export const getAccountDetails = async (): Promise<AccountDetail[]> => {
 
 export const refreshAccountProfile = async (id: string): Promise<{ success: boolean; profile?: Partial<AccountDetail> }> => {
   return post(`/cookies/${id}/refresh-profile`);
-};
-
-export const generateQRLogin = async (): Promise<{ success: boolean; session_id?: string; qr_code_url?: string }> => {
-  return post('/qr-login/generate');
-};
-
-export const checkQRLoginStatus = async (sessionId: string): Promise<any> => {
-  return get(`/qr-login/check/${sessionId}`);
 };
 
 export const updateAccountStatus = async (id: string, enabled: boolean): Promise<any> => {
@@ -154,14 +139,6 @@ export const updateAccountPauseDuration = async (id: string, pauseDuration: numb
 
 export const updateAccountCookie = async (id: string, value: string): Promise<any> => {
   return put(`/cookies/${id}`, { id, value });
-};
-
-export const updateAccountLoginInfo = async (id: string, data: {
-  username?: string;
-  login_password?: string;
-  show_browser?: boolean;
-}): Promise<any> => {
-  return put(`/cookies/${id}/login-info`, data);
 };
 
 export const getAllAISettings = async (): Promise<Record<string, AIReplySettings>> => {
@@ -410,7 +387,8 @@ export const getRiskControlStatus = async (): Promise<{
     remaining_seconds: number;
     consecutive_hits: number;
     reason: string;
-    verification_type: 'none' | 'slider' | 'face' | 'qr' | 'risk_control';
+    verification_type: 'none' | 'slider' | 'face' | 'qr' | 'risk_control' | 'expired' | 'renewing';
+    verification_kind?: '' | 'risk' | 'expired' | 'renewing';
     verification_message: string;
     verification_url?: string;
     latest_event: string;
@@ -420,30 +398,22 @@ export const getRiskControlStatus = async (): Promise<{
   return get('/api/risk-control/status');
 };
 
-// 实时取一个新鲜的验证链接。punish 链接的 x5secdata 只能用一次、约 1 小时失效，
-// 直接用风控日志里的历史链接打开只会看到「抱歉，页面访问出现了问题」。
-export const requestFreshCaptchaUrl = async (cookieId: string): Promise<{
-  success: boolean;
-  need_verify: boolean;
-  verification_url?: string;
-  message: string;
-}> => {
-  return post(`/api/risk-control/${encodeURIComponent(cookieId)}/fresh-captcha-url`);
-};
+export type BrowserCredentialStatus = { credentials_state: 'waiting' | 'captured' | 'connecting' | 'active' | 'error'; captured: boolean; captured_at?: number; message: string };
+export type BrowserStatus = BrowserListenerStatus & BrowserCredentialStatus & { account_id?: string; desktop_url?: string };
+export const fetchBrowserCredentials = (accountId: string): Promise<BrowserStatus> =>
+  post(`/api/account-browser/${encodeURIComponent(accountId)}/fetch-credentials`, {}, { timeout: 120000 });
+export type BrowserListenerStatus = { browser_running: boolean; listening: boolean; listener_state: 'connecting' | 'listening' | 'disconnected'; listener_error?: string };
+export const reconnectBrowserListener = (): Promise<BrowserDesktop & BrowserListenerStatus> => post('/api/account-browser/reconnect', {}, { timeout: 120000 });
+export type BrowserDesktop = { message: string; desktop_url?: string; open_url?: string };
 
-export const startManualCaptchaSession = async (
-  cookieId: string,
-  timeout: number = 300,
-): Promise<{
-  success: boolean;
-  message: string;
-  session_id: string;
-}> => {
-  const formData = new FormData();
-  formData.append('cookie_id', cookieId);
-  formData.append('timeout', String(timeout));
-  return post('/api/captcha/manual-session', formData, { timeout: (timeout + 30) * 1000 });
-};
+export const accountBrowserAction = (accountId: string, action: 'open' | 'restart'): Promise<BrowserDesktop> =>
+  post(`/api/account-browser/${encodeURIComponent(accountId)}/${action}`, {}, { timeout: 120000 });
+export const setupBrowserAccount = (): Promise<BrowserDesktop> => post('/api/account-browser/setup', {}, { timeout: 120000 });
+export const browserSetupStatus = (): Promise<BrowserStatus> => get('/api/account-browser/setup-status');
+export const browserDesktopLink = (): Promise<{ open_url: string }> => post('/api/account-browser/desktop-link', {});
+export const clearBrowserData = (): Promise<BrowserDesktop> => post('/api/account-browser/clear', { confirmed: true }, { timeout: 120000 });
+export const accountBrowserStatus = (accountId: string): Promise<BrowserStatus> =>
+  get(`/api/account-browser/${encodeURIComponent(accountId)}/status`);
 
 // 商品擦亮：重新获取搜索曝光，平台对每日次数有限制
 export const polishItems = async (cookieId?: string, itemIds?: string[]): Promise<any> => {
@@ -1207,6 +1177,11 @@ export const deleteRiskControlLog = async (logId: number): Promise<ApiResponse> 
   return del(`/risk-control-logs/${logId}`);
 };
 
+/** 截图要带登录凭证读取，不能直接用 <img src>。 */
+export const getRiskControlLogScreenshot = async (logId: number): Promise<Blob> => {
+  return get(`/risk-control-logs/${logId}/screenshot`, undefined, { responseType: 'blob' });
+};
+
 export const getSystemLogs = async (params: {
   lines?: number;
   level?: string;
@@ -1505,3 +1480,5 @@ export const createQuoteBook = async (file: File): Promise<{
 
 export const deleteQuoteBook = async (bookId: number): Promise<{ success: boolean }> =>
   del(`/api/logistics/quote-books/${bookId}`);
+
+export const stopAccountBrowser = (): Promise<BrowserDesktop> => post('/api/account-browser/stop', {}, { timeout: 120000 });

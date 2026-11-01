@@ -12,6 +12,7 @@
 ``FAIL_SYS_SESSION_EXPIRED``（该错误码有误导性，实际原因是来源校验失败）。
 """
 
+from utils.account_browser.credentials import platform_request
 import asyncio
 import json
 import time
@@ -208,8 +209,7 @@ class XianyuSellerAPI:
     ) -> Dict[str, Any]:
         """调用卖家端接口并返回完整响应；业务失败抛 :class:`SellerApiError`。
 
-        令牌过期时服务端会在响应里下发新的 ``_m_h5_tk``，此时用新令牌重签一次
-        即可成功，因此对这类错误自动重试而不是直接失败。
+        凭据过期立即暂停，只有原生网页捕获的新凭据可以恢复请求。
         """
         if not self.cookies_str:
             raise SellerApiError(api, ["Cookie 为空，无法调用卖家端接口"])
@@ -222,91 +222,54 @@ class XianyuSellerAPI:
                 self.cookie_id, guard.remaining_seconds, guard.last_hit_reason
             )
 
-        for attempt in range(2):
-            data_val = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-            # 毫秒时间戳：先乘再取整，避免丢失毫秒精度
-            timestamp = str(int(time.time() * 1000))
-            params = {
-                "jsv": "2.7.2",
-                "appKey": self.APP_KEY,
-                "t": timestamp,
-                "sign": generate_sign(timestamp, self._token(), data_val),
-                "v": version,
-                "type": "originaljson",
-                "accountSite": "xianyu",
-                "dataType": "json",
-                "timeout": "20000",
-                "api": api,
-                "sessionOption": "AutoLoginOnly",
-                "spm_cnt": self.SPM_CNT,
-            }
-            if value_type:
-                params["valueType"] = value_type
+        data_val = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        # 毫秒时间戳：先乘再取整，避免丢失毫秒精度
+        timestamp = str(int(time.time() * 1000))
+        params = {
+            "jsv": "2.7.2",
+            "appKey": self.APP_KEY,
+            "t": timestamp,
+            "sign": generate_sign(timestamp, self._token(), data_val),
+            "v": version,
+            "type": "originaljson",
+            "accountSite": "xianyu",
+            "dataType": "json",
+            "timeout": "20000",
+            "api": api,
+            "sessionOption": "AutoLoginOnly",
+            "spm_cnt": self.SPM_CNT,
+        }
+        if value_type:
+            params["valueType"] = value_type
 
-            session = await self._ensure_session()
-            url = self.BASE_URL.format(api=api, version=version)
-            # 限流：控制每账号的请求速率，多账号并发时也不会突发
-            await guard.acquire()
-            async with session.post(
-                url,
-                params=params,
-                data={"data": data_val},
-                headers=self._headers(),
-                timeout=aiohttp.ClientTimeout(total=timeout),
-            ) as response:
-                result = await response.json(content_type=None)
-                # 必须在判断结果前合并，令牌就在这次响应里
-                self._merge_response_cookies(response)
+        session = await self._ensure_session()
+        url = self.BASE_URL.format(api=api, version=version)
+        # 限流：控制每账号的请求速率，多账号并发时也不会突发
+        await guard.acquire()
+        async with platform_request(session, self.cookie_id, 'post', cookies=self.cookies_str,
+            url=url,
+            params=params,
+            data={"data": data_val},
+            headers=self._headers(),
+            timeout=aiohttp.ClientTimeout(total=timeout),
+        ) as response:
+            result = await response.json(content_type=None)
 
-            ret_list = [str(value) for value in (result.get("ret", []) if isinstance(result, dict) else [])]
-            if any("SUCCESS" in value for value in ret_list):
-                guard.reset()
-                return result
+        ret_list = [str(value) for value in (result.get("ret", []) if isinstance(result, dict) else [])]
+        if any("SUCCESS" in value for value in ret_list):
+            guard.reset()
+            return result
 
-            last_ret = ret_list
+        last_ret = ret_list
 
-            # 平台风控：立刻熔断，不重试
-            if risk_control.is_risk_control_error("; ".join(ret_list)):
-                guard.trip("; ".join(ret_list))
-                raise SellerApiError(api, ret_list)
+        # 平台风控：立刻熔断，不重试
+        if risk_control.is_risk_control_error("; ".join(ret_list)):
+            guard.trip("; ".join(ret_list))
+            raise SellerApiError(api, ret_list)
 
-            # 服务端对令牌过期有两种拼写，且历史版本存在拼写错误（EXOIRED）
-            token_expired = any(
-                "TOKEN_EXPIRED" in value
-                or "TOKEN_EXOIRED" in value
-                or "FAIL_SYS_TOKEN_EMPTY" in value
-                for value in ret_list
-            )
-            if not token_expired or attempt == 1:
-                break
-            logger.debug(f"【{self.cookie_id}】{api} 令牌过期，使用新令牌重试")
 
         raise SellerApiError(api, last_ret)
 
-    def _merge_response_cookies(self, response) -> None:
-        """合并响应下发的新 Cookie，保持 _m_h5_tk 等令牌为最新值。"""
-        if "set-cookie" not in response.headers:
-            return
-
-        updates: Dict[str, str] = {}
-        for raw in response.headers.getall("set-cookie", []):
-            pair = raw.split(";", 1)[0].strip()
-            if "=" not in pair:
-                continue
-            key, value = pair.split("=", 1)
-            if key in ("_m_h5_tk", "_m_h5_tk_enc", "cookie2", "sgcookie", "_tb_token_"):
-                updates[key] = value
-
-        if not updates:
-            return
-
-        try:
-            current = trans_cookies(self.cookies_str) if self.cookies_str else {}
-        except ValueError:
-            current = {}
-        current.update(updates)
-        self.cookies_str = "; ".join(f"{k}={v}" for k, v in current.items())
-        logger.debug(f"【{self.cookie_id}】卖家端 Cookie 已更新: {', '.join(updates)}")
 
     async def _call_buyer(
         self,
@@ -319,7 +282,7 @@ class XianyuSellerAPI:
         """调用买家端（www.goofish.com）接口并返回完整响应。
 
         与 :meth:`_call` 分开：买家接口校验 ``origin`` 必须是 www.goofish.com，
-        沿用卖家来源会被服务端拒绝。令牌过期时同样用响应下发的新令牌重签一次。
+        沿用卖家来源会被服务端拒绝。凭据过期立即暂停，只有原生网页捕获的新凭据可以恢复请求。
         """
         if not self.cookies_str:
             raise SellerApiError(api, ["Cookie 为空，无法调用买家端接口"])
@@ -331,67 +294,54 @@ class XianyuSellerAPI:
             )
 
         data_val = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-        last_ret: List[str] = []
 
-        for attempt in range(2):
-            timestamp = str(int(time.time() * 1000))
-            params = {
-                "jsv": "2.7.2",
-                "appKey": self.APP_KEY,
-                "t": timestamp,
-                "sign": generate_sign(timestamp, self._token(), data_val),
-                "v": version,
-                "type": "originaljson",
-                "accountSite": "xianyu",
-                "dataType": "json",
-                "timeout": "20000",
-                "api": api,
-                "sessionOption": "AutoLoginOnly",
-                "spm_cnt": spm_cnt,
-            }
-            headers = {
-                "accept": "application/json",
-                "content-type": "application/x-www-form-urlencoded",
-                "origin": self.BUYER_ORIGIN,
-                "referer": f"{self.BUYER_ORIGIN}/",
-                "user-agent": self.USER_AGENT,
-                "cookie": self.cookies_str.replace("\n", "").replace("\r", ""),
-            }
+        timestamp = str(int(time.time() * 1000))
+        params = {
+            "jsv": "2.7.2",
+            "appKey": self.APP_KEY,
+            "t": timestamp,
+            "sign": generate_sign(timestamp, self._token(), data_val),
+            "v": version,
+            "type": "originaljson",
+            "accountSite": "xianyu",
+            "dataType": "json",
+            "timeout": "20000",
+            "api": api,
+            "sessionOption": "AutoLoginOnly",
+            "spm_cnt": spm_cnt,
+        }
+        headers = {
+            "accept": "application/json",
+            "content-type": "application/x-www-form-urlencoded",
+            "origin": self.BUYER_ORIGIN,
+            "referer": f"{self.BUYER_ORIGIN}/",
+            "user-agent": self.USER_AGENT,
+            "cookie": self.cookies_str.replace("\n", "").replace("\r", ""),
+        }
 
-            session = await self._ensure_session()
-            url = self.BASE_URL.format(api=api, version=version)
-            await guard.acquire()
-            async with session.post(
-                url,
-                params=params,
-                data={"data": data_val},
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=timeout),
-            ) as response:
-                result = await response.json(content_type=None)
-                self._merge_response_cookies(response)
+        session = await self._ensure_session()
+        url = self.BASE_URL.format(api=api, version=version)
+        await guard.acquire()
+        async with platform_request(session, self.cookie_id, 'post', cookies=self.cookies_str,
+            url=url,
+            params=params,
+            data={"data": data_val},
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=timeout),
+        ) as response:
+            result = await response.json(content_type=None)
 
-            ret_list = [str(value) for value in (result.get("ret", []) if isinstance(result, dict) else [])]
-            if any("SUCCESS" in value for value in ret_list):
-                guard.reset()
-                return result
+        ret_list = [str(value) for value in (result.get("ret", []) if isinstance(result, dict) else [])]
+        if any("SUCCESS" in value for value in ret_list):
+            guard.reset()
+            return result
 
-            last_ret = ret_list
-            if risk_control.is_risk_control_error("; ".join(ret_list)):
-                guard.trip("; ".join(ret_list))
-                raise SellerApiError(api, ret_list)
+        # 平台风控：立刻熔断，不重试
+        if risk_control.is_risk_control_error("; ".join(ret_list)):
+            guard.trip("; ".join(ret_list))
+            raise SellerApiError(api, ret_list)
 
-            token_expired = any(
-                "TOKEN_EXPIRED" in value
-                or "TOKEN_EXOIRED" in value
-                or "FAIL_SYS_TOKEN_EMPTY" in value
-                for value in ret_list
-            )
-            if not token_expired or attempt == 1:
-                break
-            logger.debug(f"【{self.cookie_id}】{api} 令牌过期，使用新令牌重试")
-
-        raise SellerApiError(api, last_ret)
+        raise SellerApiError(api, ret_list)
 
     # ------------------------------------------------------------------
     # 订单

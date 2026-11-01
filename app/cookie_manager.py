@@ -20,6 +20,7 @@ class CookieManager:
         self.cookie_status: Dict[str, bool] = {}  # 账号启用状态
         self.auto_confirm_settings: Dict[str, bool] = {}  # 自动确认发货设置
         self._task_locks: Dict[str, asyncio.Lock] = {}  # 每个cookie_id的任务锁，防止重复创建
+        self.browser_paused = set()
         self._load_from_db()
 
     def _load_from_db(self):
@@ -169,6 +170,9 @@ class CookieManager:
                 logger.info(f"【{cookie_id}】账号已禁用，仅更新Cookie，不启动监听任务")
                 return None
 
+            if cookie_id in self.browser_paused:
+                return None
+
             existing_task = self.tasks.get(cookie_id)
             if existing_task and not existing_task.done():
                 if not restart:
@@ -287,6 +291,8 @@ class CookieManager:
 
     def get_task_state(self, cookie_id: str) -> str:
         """返回账号监听任务状态。"""
+        if cookie_id in self.browser_paused:
+            return "manual"
         task = self.tasks.get(cookie_id)
         if not task:
             return "stopped"
@@ -303,6 +309,8 @@ class CookieManager:
         if instance is not None:
             # 登录态过期是终态：滑块、等待冷却都救不回来，只能重新扫码。
             # 必须与普通重连区分开，否则界面只显示「连接中」，用户会一直等。
+            if getattr(instance, 'last_token_refresh_status', None) == 'waiting_browser_token':
+                return 'waiting_browser'
             if getattr(instance, 'needs_relogin', False):
                 return "need_relogin"
             state = getattr(instance, 'connection_state', None)
@@ -313,6 +321,127 @@ class CookieManager:
                 return "connecting"
         return "running"
 
+    async def _await_on_account_loop(self, coroutine):
+        """Await account work without blocking or awaiting a Task owned by another loop."""
+        if asyncio.get_running_loop() is self.loop:
+            return await coroutine
+        if not self.loop.is_running():
+            coroutine.close()
+            raise RuntimeError('账号事件循环未运行')
+        try:
+            future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
+        except BaseException:
+            coroutine.close()
+            raise
+        return await asyncio.wait_for(asyncio.wrap_future(future), timeout=30)
+
+    async def pause_cookie_task(self, cookie_id: str):
+        """Stop the account on its owner loop before a manual browser session starts."""
+        async def pause():
+            lock = self._task_locks.setdefault(cookie_id, asyncio.Lock())
+            async with lock:
+                self.browser_paused.add(cookie_id)
+                instance = self.instances.get(cookie_id)
+                if instance is not None:
+                    instance.manual_captcha_in_progress = True
+                try:
+                    task = self.tasks.get(cookie_id)
+                    if task is not None and not task.done():
+                        task.cancel()
+                        try:
+                            await asyncio.wait_for(task, timeout=15)
+                        except asyncio.CancelledError:
+                            if not task.cancelled():
+                                raise
+                finally:
+                    if instance is not None:
+                        instance.manual_captcha_in_progress = False
+
+        await self._await_on_account_loop(pause())
+
+    async def release_browser_pause(self, cookie_id: str):
+        async def release():
+            self.browser_paused.discard(cookie_id)
+        await self._await_on_account_loop(release())
+
+    async def resume_cookie_task(self, cookie_id: str, cookies: str):
+        async def resume():
+            self.browser_paused.discard(cookie_id)
+            try:
+                await self._update_cookie_async(cookie_id, cookies, save_to_db=False)
+            except BaseException:
+                self.browser_paused.add(cookie_id)
+                raise
+        await self._await_on_account_loop(resume())
+
+    async def update_cookie_async(self, cookie_id: str, new_value: str, save_to_db: bool = True):
+        """Async callers use this entry point from either event loop."""
+        await self._await_on_account_loop(self._update_cookie_async(cookie_id, new_value, save_to_db))
+
+    async def _update_cookie_async(self, cookie_id: str, new_value: str, save_to_db: bool):
+        """Update and restart on the account loop; shared by sync and async callers."""
+        # 获取或创建该cookie_id的锁
+        if cookie_id not in self._task_locks:
+            self._task_locks[cookie_id] = asyncio.Lock()
+
+        async with self._task_locks[cookie_id]:
+            # 获取原有的user_id和关键词
+            original_user_id = None
+            original_keywords = []
+            original_status = True
+
+            cookie_info = db_manager.get_cookie_details(cookie_id)
+            if cookie_info:
+                original_user_id = cookie_info.get('user_id')
+
+            # 保存原有的关键词和状态
+            if cookie_id in self.keywords:
+                original_keywords = self.keywords[cookie_id].copy()
+            if cookie_id in self.cookie_status:
+                original_status = self.cookie_status[cookie_id]
+
+            # 先移除任务（但不删除数据库记录）
+            task = self.tasks.pop(cookie_id, None)
+            if task:
+                logger.info(f"【{cookie_id}】正在停止旧任务...")
+                task.cancel()
+                try:
+                    # 等待任务完全清理，确保资源释放
+                    await asyncio.wait_for(task, timeout=10.0)
+                except asyncio.TimeoutError:
+                    logger.warning(f"【{cookie_id}】等待旧任务停止超时（10秒），强制继续")
+                except asyncio.CancelledError:
+                    # 任务被取消是预期行为
+                    logger.debug(f"【{cookie_id}】旧任务已取消")
+                except Exception as e:
+                    logger.error(f"等待任务清理时出错: {cookie_id}, {e}")
+                logger.info(f"【{cookie_id}】旧任务已停止")
+
+            # 更新Cookie值
+            self.cookies[cookie_id] = new_value
+
+            # 只有在需要时才保存到数据库（避免覆盖其他字段如pause_duration、remark等）
+            if save_to_db:
+                db_manager.save_cookie(cookie_id, new_value, original_user_id)
+
+            # 恢复关键词和状态
+            self.keywords[cookie_id] = original_keywords
+            self.cookie_status[cookie_id] = original_status
+
+            if original_status and cookie_id not in self.browser_paused:
+                task = self.loop.create_task(
+                    self._run_xianyu(cookie_id, new_value, original_user_id),
+                    name=f"xianyu-account-{cookie_id}",
+                )
+                self._register_task(cookie_id, task)
+                logger.info(
+                    f"已更新Cookie并重启任务: {cookie_id} "
+                    f"(用户ID: {original_user_id}, 关键词: {len(original_keywords)}条)"
+                )
+            else:
+                logger.info(f"已更新禁用账号Cookie，不启动任务: {cookie_id}")
+
+
     # 更新 Cookie 值
     def update_cookie(self, cookie_id: str, new_value: str, save_to_db: bool = True):
         """替换指定账号的 Cookie 并重启任务
@@ -322,77 +451,15 @@ class CookieManager:
             new_value: 新的Cookie值
             save_to_db: 是否保存到数据库（默认True）。当API层已经更新数据库时应设为False，避免覆盖其他字段
         """
-        async def _update():
-            # 获取或创建该cookie_id的锁
-            if cookie_id not in self._task_locks:
-                self._task_locks[cookie_id] = asyncio.Lock()
-            
-            async with self._task_locks[cookie_id]:
-                # 获取原有的user_id和关键词
-                original_user_id = None
-                original_keywords = []
-                original_status = True
-
-                cookie_info = db_manager.get_cookie_details(cookie_id)
-                if cookie_info:
-                    original_user_id = cookie_info.get('user_id')
-
-                # 保存原有的关键词和状态
-                if cookie_id in self.keywords:
-                    original_keywords = self.keywords[cookie_id].copy()
-                if cookie_id in self.cookie_status:
-                    original_status = self.cookie_status[cookie_id]
-
-                # 先移除任务（但不删除数据库记录）
-                task = self.tasks.pop(cookie_id, None)
-                if task:
-                    logger.info(f"【{cookie_id}】正在停止旧任务...")
-                    task.cancel()
-                    try:
-                        # 等待任务完全清理，确保资源释放
-                        await asyncio.wait_for(task, timeout=10.0)
-                    except asyncio.TimeoutError:
-                        logger.warning(f"【{cookie_id}】等待旧任务停止超时（10秒），强制继续")
-                    except asyncio.CancelledError:
-                        # 任务被取消是预期行为
-                        logger.debug(f"【{cookie_id}】旧任务已取消")
-                    except Exception as e:
-                        logger.error(f"等待任务清理时出错: {cookie_id}, {e}")
-                    logger.info(f"【{cookie_id}】旧任务已停止")
-
-                # 更新Cookie值
-                self.cookies[cookie_id] = new_value
-                
-                # 只有在需要时才保存到数据库（避免覆盖其他字段如pause_duration、remark等）
-                if save_to_db:
-                    db_manager.save_cookie(cookie_id, new_value, original_user_id)
-
-                # 恢复关键词和状态
-                self.keywords[cookie_id] = original_keywords
-                self.cookie_status[cookie_id] = original_status
-
-                if original_status:
-                    task = self.loop.create_task(
-                        self._run_xianyu(cookie_id, new_value, original_user_id),
-                        name=f"xianyu-account-{cookie_id}",
-                    )
-                    self._register_task(cookie_id, task)
-                    logger.info(
-                        f"已更新Cookie并重启任务: {cookie_id} "
-                        f"(用户ID: {original_user_id}, 关键词: {len(original_keywords)}条)"
-                    )
-                else:
-                    logger.info(f"已更新禁用账号Cookie，不启动任务: {cookie_id}")
-
         try:
             current_loop = asyncio.get_running_loop()
         except RuntimeError:
             current_loop = None
 
         if current_loop and current_loop == self.loop:
-            return self.loop.create_task(_update())
+            return self.loop.create_task(self._update_cookie_async(cookie_id, new_value, save_to_db))
         else:
-            fut = asyncio.run_coroutine_threadsafe(_update(), self.loop)
+            fut = asyncio.run_coroutine_threadsafe(self._update_cookie_async(cookie_id, new_value, save_to_db), self.loop)
             # 更新 Cookie 会重启账号任务，同样需要超时兜底
             try:
                 return fut.result(timeout=30)

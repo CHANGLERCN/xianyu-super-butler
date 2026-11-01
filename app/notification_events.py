@@ -20,15 +20,15 @@ DEFAULT_EVENT_TYPE = "cookie_invalid"
 EVENT_DEFINITIONS: List[Dict[str, str]] = [
     {
         "id": "captcha_manual",
-        "label": "人工验证提醒",
+        "label": "平台风控 · 人工验证",
         "priority": "critical",
-        "description": "滑块、人脸或扫码验证需要人工处理",
+        "description": "闲鱼要求滑块、人脸或扫码验证，账号已暂停，需要人工处理",
     },
     {
         "id": "cookie_invalid",
-        "label": "Token/Cookie 异常",
+        "label": "凭据到期 / Cookie 异常",
         "priority": "critical",
-        "description": "Token 刷新失败、Cookie 失效或更新失败",
+        "description": "消息 Token 到期后自动续期失败、Cookie 失效或更新失败",
     },
     {
         "id": "delivery_failed",
@@ -73,6 +73,12 @@ EVENT_DEFINITIONS: List[Dict[str, str]] = [
         "description": "密码登录成功、滑块验证成功等",
     },
     {
+        "id": "credential_recovered",
+        "label": "凭据自动恢复",
+        "priority": "info",
+        "description": "续期失败告警后，系统自行续期成功；人工处理恢复的不通知",
+    },
+    {
         "id": "buyer_message",
         "label": "买家消息",
         "priority": "info",
@@ -106,7 +112,6 @@ TOKEN_NOTIFICATION_EVENT_MAP = {
     "face_verification": "captcha_manual",
     "captcha_success_db_update_failed": "cookie_invalid",
     "captcha_success_auto_update": "login_success",
-    "password_login_success": "login_success",
     "instance_restart_failed": "instance_restart_failed",
 }
 

@@ -8,6 +8,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Edit3,
+  ImageIcon,
   Link2,
   Loader2,
   Plus,
@@ -40,6 +41,7 @@ import {
   getNotificationChannels,
   getNotificationEvents,
   getRiskControlLogs,
+  getRiskControlLogScreenshot,
   getSystemLogs,
   setMessageNotification,
   testMessageNotification,
@@ -160,6 +162,12 @@ const formatTime = (value?: string) => {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN');
 };
 
+/** SQLite CURRENT_TIMESTAMP is UTC without a zone ("2026-10-28 08:01:48"); show it in local time. */
+const formatDbTime = (value?: string) => {
+  if (!value) return '-';
+  return formatTime(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?$/.test(value) ? `${value.replace(' ', 'T')}Z` : value);
+};
+
 const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) => {
   const [activeTab, setActiveTab] = useState<PageTab>('channels');
   const [accounts, setAccounts] = useState<AccountDetail[]>([]);
@@ -188,6 +196,8 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
   const [riskStatus, setRiskStatus] = useState('');
   const [riskPage, setRiskPage] = useState(0);
   const [riskLoading, setRiskLoading] = useState(false);
+  const [screenshot, setScreenshot] = useState<{ url: string; log: RiskControlLog } | null>(null);
+  const [loadingScreenshot, setLoadingScreenshot] = useState<number | null>(null);
   const [systemLogs, setSystemLogs] = useState<SystemLog[]>([]);
   const [systemLevel, setSystemLevel] = useState('');
   const [systemSource, setSystemSource] = useState('');
@@ -476,6 +486,23 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
     }
   };
 
+  const openScreenshot = async (log: RiskControlLog) => {
+    setLoadingScreenshot(log.id);
+    try {
+      const blob = await getRiskControlLogScreenshot(log.id);
+      setScreenshot({ url: URL.createObjectURL(blob), log });
+    } catch {
+      notify('截图不存在或已被清理，只保留最近 10 张');
+    } finally {
+      setLoadingScreenshot(null);
+    }
+  };
+
+  const closeScreenshot = () => {
+    if (screenshot) URL.revokeObjectURL(screenshot.url);
+    setScreenshot(null);
+  };
+
   const loadSystemLogs = async () => {
     if (!isAdmin) return;
     setSystemLoading(true);
@@ -572,7 +599,7 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
                   </div>
                   <p className="mt-1 text-xs text-gray-500">
                     {channel.enabled ? '可用于账号通知' : '已停用'}
-                    {channel.updated_at ? ` · 更新于 ${formatTime(channel.updated_at)}` : ''}
+                    {channel.updated_at ? ` · 更新于 ${formatDbTime(channel.updated_at)}` : ''}
                   </p>
                 </div>
                 <div className="flex gap-2">
@@ -766,7 +793,7 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
               <div key={log.id} className="grid gap-3 py-4 lg:grid-cols-[180px_120px_minmax(0,1fr)_44px] lg:items-start">
                 <div>
                   <p className="break-all text-sm font-bold text-gray-900">{log.cookie_id}</p>
-                  <p className="mt-1 text-xs text-gray-500">{formatTime(log.created_at)}</p>
+                  <p className="mt-1 text-xs text-gray-500">{formatDbTime(log.created_at)}</p>
                 </div>
                 <div>
                   <span className={`inline-flex rounded px-2 py-1 text-xs font-bold ${
@@ -787,6 +814,17 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
                   )}
                   {log.error_message && (
                     <p className="mt-1 break-words text-xs text-red-600">{log.error_message}</p>
+                  )}
+                  {log.screenshot && (
+                    <button
+                      type="button"
+                      onClick={() => void openScreenshot(log)}
+                      disabled={loadingScreenshot === log.id}
+                      className="mt-2 inline-flex items-center gap-1.5 rounded-md bg-gray-100 px-2.5 py-1 text-xs font-bold text-gray-700 hover:bg-gray-200 disabled:opacity-50"
+                    >
+                      {loadingScreenshot === log.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ImageIcon className="h-3.5 w-3.5" />}
+                      查看截图
+                    </button>
                   )}
                 </div>
                 <button
@@ -986,6 +1024,32 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
                 {savingChannel ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
                 保存
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {screenshot && (
+        <div className="modal-overlay" onClick={closeScreenshot}>
+          <div className="modal-container max-w-5xl" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-header flex items-start justify-between gap-4">
+              <div>
+                <h3 className="text-lg font-bold text-gray-900">失败时的页面截图</h3>
+                <p className="mt-1 text-sm text-gray-500">
+                  {screenshot.log.cookie_id} · {formatDbTime(screenshot.log.created_at)}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={closeScreenshot}
+                title="关闭"
+                className="flex h-9 w-9 items-center justify-center rounded-md text-gray-500 hover:bg-gray-100"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+            <div className="modal-body">
+              <img src={screenshot.url} alt="续期失败时的闲鱼页面" className="w-full rounded-md border border-gray-200" />
             </div>
           </div>
         </div>

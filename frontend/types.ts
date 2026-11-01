@@ -39,10 +39,6 @@ export interface AccountDetail {
   remark?: string;
   note?: string; // alias for remark
   pause_duration?: number;
-  // 登录信息
-  username?: string;
-  login_password?: string;
-  show_browser?: boolean;
   // Frontend helpers
   nickname?: string;
   avatar_url?: string;
@@ -51,7 +47,7 @@ export interface AccountDetail {
   followers?: number;
   following?: number;
   profile_updated_at?: string;
-  runtime_state?: 'running' | 'connecting' | 'need_relogin' | 'stopped' | 'cancelled' | 'failed';
+  runtime_state?: 'waiting_browser' | 'manual' | 'running' | 'connecting' | 'need_relogin' | 'stopped' | 'cancelled' | 'failed';
   // AI设置
   ai_enabled?: boolean;
   max_discount_percent?: number;
@@ -409,6 +405,8 @@ export interface RiskControlLog {
   processing_result?: string;
   processing_status: 'processing' | 'success' | 'failed' | string;
   error_message?: string;
+  /** 续期失败时的页面截图文件名，通过接口按权限读取 */
+  screenshot?: string | null;
   created_at: string;
   updated_at?: string;
 }
@@ -551,6 +549,7 @@ export interface OrderAnalytics {
 
 // Settings
 export interface SystemSettings {
+  browser_desktop_url?: string;
   ai_model?: string;
   ai_api_key?: string;
   ai_base_url?: string;

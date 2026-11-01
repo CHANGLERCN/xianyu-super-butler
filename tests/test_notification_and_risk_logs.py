@@ -73,7 +73,8 @@ class NotificationEventDefinitionTests(unittest.TestCase):
         from app.notification_events import normalize_event_types, resolve_event_type
 
         self.assertEqual(resolve_event_type("face_verification"), "captcha_manual")
-        self.assertEqual(resolve_event_type("password_login_success"), "login_success")
+        # personal 分支移除密码登录后，该事件不再映射为 login_success，回退默认类型
+        self.assertEqual(resolve_event_type("password_login_success"), "cookie_invalid")
         self.assertEqual(resolve_event_type("unknown_type"), "cookie_invalid")
 
     def test_normalize_event_types_orders_and_validates(self):
